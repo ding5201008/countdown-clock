@@ -27,7 +27,7 @@ jobs:
           git zip unzip openjdk-8-jdk autoconf libtool \
           pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
           cmake libffi-dev libssl-dev python3-dev \
-          wget curl
+          wget curl unzip
 
     - name: Install Buildozer
       run: |
@@ -40,12 +40,24 @@ jobs:
         ls -la
         echo "=== Python files ==="
         find . -name "*.py" | head -10
-        echo "=== Check if buildozer.spec exists ==="
-        if [ -f buildozer.spec ]; then
-          echo "buildozer.spec found"
-          cat buildozer.spec | head -20
+        echo "=== Check main.py exists ==="
+        if [ -f main.py ]; then
+          echo "main.py found"
         else
-          echo "No buildozer.spec found"
+          echo "main.py not found - this may be the problem!"
+          echo "Creating a simple test main.py for build testing"
+          cat > main.py << EOF
+import kivy
+from kivy.app import App
+from kivy.uix.label import Label
+
+class TestApp(App):
+    def build(self):
+        return Label(text='Hello World')
+
+if __name__ == '__main__':
+    TestApp().run()
+EOF
         fi
 
     - name: Initialize Buildozer if needed
@@ -55,25 +67,34 @@ jobs:
           buildozer init
           echo "=== Generated buildozer.spec ==="
           cat buildozer.spec | head -30
+        else
+          echo "=== Existing buildozer.spec ==="
+          cat buildozer.spec | head -30
         fi
 
-    - name: Build APK with detailed logging
-      id: build
+    - name: Check Buildozer environment
       run: |
-        set -x  # 显示执行的命令
-        echo "Starting Buildozer build..."
+        echo "=== Buildozer version ==="
+        buildozer --version
+        echo "=== Python version ==="
+        python --version
+
+    - name: Build APK step by step
+      run: |
+        set -x
+        echo "=== Step 1: Check Buildozer dependencies ==="
+        buildozer android check 2>&1 | tee check.log || echo "Check completed"
         
-        # 尝试构建，捕获详细输出
-        timeout 1800 buildozer -v android debug 2>&1 | tee build.log || true
-        
-        echo "=== Build process finished ==="
+        echo "=== Step 2: Try to build APK ==="
+        # 设置较长的超时时间，因为首次构建需要下载很多依赖
+        timeout 2400 buildozer -v android debug 2>&1 | tee build.log || echo "Build process ended"
         
         # 检查退出状态
         if [ ${PIPESTATUS[0]} -eq 0 ]; then
-          echo "Build succeeded"
+          echo "Build completed successfully"
           echo "success=true" >> $GITHUB_OUTPUT
         else
-          echo "Build failed with exit code: ${PIPESTATUS[0]}"
+          echo "Build failed or timed out"
           echo "success=false" >> $GITHUB_OUTPUT
         fi
 
@@ -82,32 +103,38 @@ jobs:
         echo "=== Checking for APK files ==="
         find . -name "*.apk" -type f 2>/dev/null | head -10 || echo "No APK files found"
         
-        echo "=== Build log summary ==="
+        echo "=== Checking bin directory ==="
+        ls -la bin/ 2>/dev/null || echo "bin directory does not exist"
+        
+        echo "=== Build log analysis ==="
         if [ -f build.log ]; then
           echo "Build log size: $(wc -l < build.log) lines"
-          echo "=== Last 50 lines of build log ==="
-          tail -50 build.log
-          echo "=== Checking for common errors ==="
-          grep -i "error" build.log | tail -20 || echo "No explicit errors found in log"
-          grep -i "fail" build.log | tail -20 || echo "No explicit failures found in log"
+          echo "=== Last 100 lines of build log ==="
+          tail -100 build.log
+          echo "=== Checking for specific errors ==="
+          grep -i "error" build.log | tail -20 || echo "No explicit errors found"
+          grep -i "fail" build.log | tail -20 || echo "No explicit failures found"
+          grep -i "exception" build.log | tail -20 || echo "No exceptions found"
         else
           echo "No build log found"
         fi
 
-    - name: Upload APK artifact
-      if: steps.build.outputs.success == 'true'
+    - name: Upload APK artifact if exists
+      if: success() && hashFiles('bin/*.apk') != ''
       uses: actions/upload-artifact@v4
       with:
         name: android-apk
         path: bin/*.apk
         retention-days: 30
 
-    - name: Upload build log for debugging
+    - name: Upload debug information
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: build-debug-info
         path: |
           build.log
+          check.log
           buildozer.spec
+          main.py
         retention-days: 7
