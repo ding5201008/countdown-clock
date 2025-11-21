@@ -1,3 +1,4 @@
+
 name: Build Android APK
 
 on:
@@ -41,12 +42,9 @@ jobs:
         echo "=== Python files ==="
         find . -name "*.py" | head -10
         echo "=== Check main.py exists ==="
-        if [ -f main.py ]; then
-          echo "main.py found"
-        else
-          echo "main.py not found - this may be the problem!"
-          echo "Creating a simple test main.py for build testing"
-          cat > main.py << EOF
+        if [ ! -f main.py ]; then
+          echo "main.py not found - creating a simple test main.py"
+          cat > main.py << 'EOF'
 import kivy
 from kivy.app import App
 from kivy.uix.label import Label
@@ -80,6 +78,7 @@ EOF
         python --version
 
     - name: Build APK step by step
+      id: build-step
       run: |
         set -x
         echo "=== Step 1: Check Buildozer dependencies ==="
@@ -120,11 +119,11 @@ EOF
         fi
 
     - name: Upload APK artifact if exists
-      if: success() && hashFiles('bin/*.apk') != ''
+      if: steps.build-step.outputs.success == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: android-apk
-        path: bin/*.apk
+        path: bin/
         retention-days: 30
 
     - name: Upload debug information
