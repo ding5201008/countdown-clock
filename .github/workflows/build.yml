@@ -27,12 +27,12 @@ jobs:
           git zip unzip openjdk-8-jdk autoconf libtool \
           pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev \
           cmake libffi-dev libssl-dev python3-dev \
-          wget curl
+          wget curl unzip tar
 
-    - name: Install Buildozer
+    - name: Install Buildozer and dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install buildozer cython
+        pip install buildozer cython virtualenv
 
     - name: Check project structure
       run: |
@@ -40,12 +40,11 @@ jobs:
         ls -la
         echo "=== Python files ==="
         find . -name "*.py" | head -10
-        echo "=== Check if buildozer.spec exists ==="
-        if [ -f buildozer.spec ]; then
-          echo "buildozer.spec found"
-          cat buildozer.spec | head -20
+        echo "=== Check main entry point ==="
+        if [ -f main.py ]; then
+          echo "main.py found"
         else
-          echo "No buildozer.spec found"
+          echo "WARNING: main.py not found - this is required for Buildozer"
         fi
 
     - name: Initialize Buildozer if needed
@@ -55,69 +54,108 @@ jobs:
           buildozer init
           echo "=== Generated buildozer.spec ==="
           cat buildozer.spec | head -30
+        else
+          echo "=== Existing buildozer.spec ==="
+          cat buildozer.spec | head -30
         fi
+
+    - name: Configure Buildozer for CI environment
+      run: |
+        # 设置Buildozer使用CI友好的配置
+        if [ -f buildozer.spec ]; then
+          # 备份原始spec文件
+          cp buildozer.spec buildozer.spec.backup
+          
+          # 在CI环境中，我们可以调整一些设置来优化构建
+          echo "Configuring Buildozer for CI..."
+          
+          # 确保log_level设置为2（详细信息）
+          sed -i 's/^#log_level = [0-9]/log_level = 2/' buildozer.spec
+          sed -i 's/^log_level = [0-9]/log_level = 2/' buildozer.spec
+          
+          # 设置更快的构建配置（如果适用）
+          echo "Applied CI optimizations"
+        fi
+
+    - name: Download Android SDK and NDK (pre-cache)
+      run: |
+        mkdir -p ~/.buildozer/android/platform/
+        echo "Android SDK/NDK will be downloaded by Buildozer during build"
 
     - name: Build APK with detailed logging
       id: build
+      timeout-minutes: 45
       run: |
-        set -x  # 显示执行的命令
+        set -x
         echo "Starting Buildozer build..."
         
-        # 尝试构建，捕获详细输出
-        timeout 1800 buildozer -v android debug 2>&1 | tee build.log || true
+        # 设置环境变量
+        export PATH=$PATH:~/.buildozer/android/platform/android-sdk/tools/bin
         
-        echo "=== Build process finished ==="
+        # 清理之前的构建
+        buildozer android clean 2>&1 | tee -a build.log || true
         
-        # 检查退出状态
-        if [ ${PIPESTATUS[0]} -eq 0 ]; then
+        # 尝试构建APK
+        echo "=== Starting APK build ==="
+        buildozer -v android debug 2>&1 | tee -a build.log || BUILD_EXIT_CODE=${PIPESTATUS[0]}
+        
+        # 检查构建状态
+        if [ ${BUILD_EXIT_CODE:-0} -eq 0 ]; then
           echo "Build succeeded"
           echo "success=true" >> $GITHUB_OUTPUT
         else
-          echo "Build failed with exit code: ${PIPESTATUS[0]}"
+          echo "Build failed with exit code: ${BUILD_EXIT_CODE}"
           echo "success=false" >> $GITHUB_OUTPUT
         fi
 
-    - name: Check if APK exists
-      id: check-apk
-      run: |
+        # 检查生成的APK
         if ls bin/*.apk 1> /dev/null 2>&1; then
-          echo "APK file found"
+          echo "APK files found:"
+          ls -la bin/*.apk
           echo "apk-exists=true" >> $GITHUB_OUTPUT
         else
-          echo "No APK file found"
+          echo "No APK files found in bin/"
           echo "apk-exists=false" >> $GITHUB_OUTPUT
         fi
 
-    - name: Analyze build results
+    - name: Debug build issues
+      if: steps.build.outputs.success != 'true'
       run: |
-        echo "=== Checking for APK files ==="
-        find . -name "*.apk" -type f 2>/dev/null | head -10 || echo "No APK files found"
+        echo "=== Build Debug Information ==="
         
-        echo "=== Build log summary ==="
+        # 检查buildozer目录
+        echo "=== Buildozer directory structure ==="
+        find ~/.buildozer -type f -name "*.log" | head -10
+        
+        # 检查Android SDK/NDK
+        echo "=== Android SDK/NDK status ==="
+        ls -la ~/.buildozer/android/platform/ 2>/dev/null || echo "No platform directory"
+        
+        # 分析构建日志
         if [ -f build.log ]; then
-          echo "Build log size: $(wc -l < build.log) lines"
-          echo "=== Last 50 lines of build log ==="
-          tail -50 build.log
-          echo "=== Checking for common errors ==="
-          grep -i "error" build.log | tail -20 || echo "No explicit errors found in log"
-          grep -i "fail" build.log | tail -20 || echo "No explicit failures found in log"
-        else
-          echo "No build log found"
+          echo "=== Last 100 lines of build log ==="
+          tail -100 build.log
+          
+          echo "=== Error patterns in build log ==="
+          grep -i -E "error|fail|exception|not found|missing" build.log | tail -30 || echo "No obvious errors found"
+          
+          echo "=== Build completion status ==="
+          tail -20 build.log
         fi
 
     - name: Upload APK artifact
-      if: steps.check-apk.outputs.apk-exists == 'true'
+      if: steps.build.outputs.apk-exists == 'true'
       uses: actions/upload-artifact@v4
       with:
         name: android-apk
-        path: bin/
+        path: bin/*.apk
         retention-days: 30
 
-    - name: Upload build log for debugging
+    - name: Upload build logs for debugging
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: build-debug-info
+        name: build-debug-logs
         path: |
           build.log
           buildozer.spec
