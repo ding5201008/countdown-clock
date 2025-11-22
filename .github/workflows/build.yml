@@ -1,11 +1,13 @@
-name: Build Android APK
+name: Build and Release Android APK
 
 on:
   push:
     branches: [ main, master ]
+    tags:
+      - 'v*'  # 在推送v开头的标签时触发发布
   pull_request:
     branches: [ main, master ]
-  workflow_dispatch:
+  workflow_dispatch:  # 允许手动触发
 
 jobs:
   build:
@@ -14,6 +16,8 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # 获取所有历史记录，用于生成changelog
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -38,13 +42,13 @@ jobs:
       run: |
         echo "=== Project Structure ==="
         ls -la
-        echo "=== Python files ==="
-        find . -name "*.py" | head -10
-        echo "=== Check main entry point ==="
+        echo "=== Checking main.py ==="
         if [ -f main.py ]; then
           echo "main.py found"
         else
-          echo "WARNING: main.py not found - this is required for Buildozer"
+          echo "WARNING: main.py not found"
+          # 尝试寻找其他可能的入口点
+          find . -name "*.py" -type f | head -10
         fi
 
     - name: Initialize Buildozer if needed
@@ -61,26 +65,13 @@ jobs:
 
     - name: Configure Buildozer for CI environment
       run: |
-        # 设置Buildozer使用CI友好的配置
         if [ -f buildozer.spec ]; then
-          # 备份原始spec文件
-          cp buildozer.spec buildozer.spec.backup
-          
-          # 在CI环境中，我们可以调整一些设置来优化构建
           echo "Configuring Buildozer for CI..."
-          
           # 确保log_level设置为2（详细信息）
-          sed -i 's/^#log_level = [0-9]/log_level = 2/' buildozer.spec
-          sed -i 's/^log_level = [0-9]/log_level = 2/' buildozer.spec
-          
-          # 设置更快的构建配置（如果适用）
+          sed -i 's/^#log_level = [0-9]/log_level = 2/' buildozer.spec || true
+          sed -i 's/^log_level = [0-9]/log_level = 2/' buildozer.spec || true
           echo "Applied CI optimizations"
         fi
-
-    - name: Download Android SDK and NDK (pre-cache)
-      run: |
-        mkdir -p ~/.buildozer/android/platform/
-        echo "Android SDK/NDK will be downloaded by Buildozer during build"
 
     - name: Build APK with detailed logging
       id: build
@@ -95,7 +86,7 @@ jobs:
         # 清理之前的构建
         buildozer android clean 2>&1 | tee -a build.log || true
         
-        # 尝试构建APK
+        # 构建APK
         echo "=== Starting APK build ==="
         buildozer -v android debug 2>&1 | tee -a build.log || BUILD_EXIT_CODE=${PIPESTATUS[0]}
         
@@ -112,11 +103,85 @@ jobs:
         if ls bin/*.apk 1> /dev/null 2>&1; then
           echo "APK files found:"
           ls -la bin/*.apk
+          APK_FILE=$(ls bin/*.apk | head -1)
+          echo "apk-file=${APK_FILE}" >> $GITHUB_OUTPUT
           echo "apk-exists=true" >> $GITHUB_OUTPUT
         else
           echo "No APK files found in bin/"
           echo "apk-exists=false" >> $GITHUB_OUTPUT
         fi
+
+    - name: Get version info
+      id: version
+      run: |
+        # 尝试从buildozer.spec获取版本信息
+        if [ -f buildozer.spec ]; then
+          VERSION=$(grep '^version' buildozer.spec | head -1 | cut -d'=' -f2 | tr -d ' ' || echo "0.1")
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        else
+          echo "version=0.1" >> $GITHUB_OUTPUT
+        fi
+        
+        # 获取当前标签或commit hash
+        if [ -n "${{ github.ref_type }}" ] && [ "${{ github.ref_type }}" = "tag" ]; then
+          echo "is-tag=true" >> $GITHUB_OUTPUT
+          echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+        else
+          echo "is-tag=false" >> $GITHUB_OUTPUT
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          echo "commit-sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Upload APK to GitHub Release
+      if: steps.build.outputs.apk-exists == 'true' && steps.version.outputs.is-tag == 'true'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ steps.build.outputs.apk-file }}
+        body: |
+          # APK Release - ${{ steps.version.outputs.tag }}
+          
+          ## Build Information
+          - **Version:** ${{ steps.version.outputs.version }}
+          - **Tag:** ${{ steps.version.outputs.tag }}
+          - **Commit:** ${{ github.sha }}
+          - **Build Date:** ${{ fromJSON(steps.version.outputs.is-tag) && fromJSON(steps.build.outputs.apk-exists) && fromJSON(steps.build.outputs.success) && format('{0}', fromJSON('"' + (fromJSON('"\'now\'"') && fromJSON('"\'Y-m-d H:i:s\'"')) + '"')) }}
+          
+          ## Installation
+          1. Download the APK file
+          2. Enable "Install from unknown sources" in Android settings
+          3. Install the APK
+          
+          ## Notes
+          This is an automated build from GitHub Actions.
+        draft: false
+        prerelease: ${{ contains(steps.version.outputs.tag, '-alpha') || contains(steps.version.outputs.tag, '-beta') || contains(steps.version.outputs.tag, '-rc') }}
+
+    - name: Upload APK as artifact (for non-tag builds)
+      if: steps.build.outputs.apk-exists == 'true' && steps.version.outputs.is-tag == 'false'
+      uses: actions/upload-artifact@v4
+      with:
+        name: android-apk-${{ steps.version.outputs.commit-sha }}
+        path: ${{ steps.build.outputs.apk-file }}
+        retention-days: 30
+
+    - name: Create pre-release for testing
+      if: steps.build.outputs.apk-exists == 'true' && github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v1
+      with:
+        files: ${{ steps.build.outputs.apk-file }}
+        tag_name: test-build-${{ steps.version.outputs.commit-sha }}
+        name: "Test Build - ${{ steps.version.outputs.commit-sha }}"
+        body: |
+          # Test Build
+          
+          This is a test build triggered manually via GitHub Actions.
+          
+          - **Commit:** ${{ steps.version.outputs.commit-sha }}
+          - **Build Date:** ${{ fromJSON(steps.version.outputs.is-tag) && fromJSON(steps.build.outputs.apk-exists) && fromJSON(steps.build.outputs.success) && format('{0}', fromJSON('"' + (fromJSON('"\'now\'"') && fromJSON('"\'Y-m-d H:i:s\'"')) + '"')) }}
+          
+          This release will be automatically cleaned up after 7 days.
+        draft: false
+        prerelease: true
 
     - name: Debug build issues
       if: steps.build.outputs.success != 'true'
@@ -127,10 +192,6 @@ jobs:
         echo "=== Buildozer directory structure ==="
         find ~/.buildozer -type f -name "*.log" | head -10
         
-        # 检查Android SDK/NDK
-        echo "=== Android SDK/NDK status ==="
-        ls -la ~/.buildozer/android/platform/ 2>/dev/null || echo "No platform directory"
-        
         # 分析构建日志
         if [ -f build.log ]; then
           echo "=== Last 100 lines of build log ==="
@@ -138,21 +199,10 @@ jobs:
           
           echo "=== Error patterns in build log ==="
           grep -i -E "error|fail|exception|not found|missing" build.log | tail -30 || echo "No obvious errors found"
-          
-          echo "=== Build completion status ==="
-          tail -20 build.log
         fi
 
-    - name: Upload APK artifact
-      if: steps.build.outputs.apk-exists == 'true'
-      uses: actions/upload-artifact@v4
-      with:
-        name: android-apk
-        path: bin/*.apk
-        retention-days: 30
-
     - name: Upload build logs for debugging
-      if: always()
+      if: always() && steps.build.outputs.success != 'true'
       uses: actions/upload-artifact@v4
       with:
         name: build-debug-logs
