@@ -17,7 +17,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # 获取所有历史记录，用于生成changelog
+        fetch-depth: 0
 
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -42,12 +42,10 @@ jobs:
       run: |
         echo "=== Project Structure ==="
         ls -la
-        echo "=== Checking main.py ==="
         if [ -f main.py ]; then
           echo "main.py found"
         else
           echo "WARNING: main.py not found"
-          # 尝试寻找其他可能的入口点
           find . -name "*.py" -type f | head -10
         fi
 
@@ -67,7 +65,6 @@ jobs:
       run: |
         if [ -f buildozer.spec ]; then
           echo "Configuring Buildozer for CI..."
-          # 确保log_level设置为2（详细信息）
           sed -i 's/^#log_level = [0-9]/log_level = 2/' buildozer.spec || true
           sed -i 's/^log_level = [0-9]/log_level = 2/' buildozer.spec || true
           echo "Applied CI optimizations"
@@ -80,17 +77,13 @@ jobs:
         set -x
         echo "Starting Buildozer build..."
         
-        # 设置环境变量
         export PATH=$PATH:~/.buildozer/android/platform/android-sdk/tools/bin
         
-        # 清理之前的构建
         buildozer android clean 2>&1 | tee -a build.log || true
         
-        # 构建APK
         echo "=== Starting APK build ==="
         buildozer -v android debug 2>&1 | tee -a build.log || BUILD_EXIT_CODE=${PIPESTATUS[0]}
         
-        # 检查构建状态
         if [ ${BUILD_EXIT_CODE:-0} -eq 0 ]; then
           echo "Build succeeded"
           echo "success=true" >> $GITHUB_OUTPUT
@@ -99,7 +92,6 @@ jobs:
           echo "success=false" >> $GITHUB_OUTPUT
         fi
 
-        # 检查生成的APK
         if ls bin/*.apk 1> /dev/null 2>&1; then
           echo "APK files found:"
           ls -la bin/*.apk
@@ -114,7 +106,6 @@ jobs:
     - name: Get version info
       id: version
       run: |
-        # 尝试从buildozer.spec获取版本信息
         if [ -f buildozer.spec ]; then
           VERSION=$(grep '^version' buildozer.spec | head -1 | cut -d'=' -f2 | tr -d ' ' || echo "0.1")
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
@@ -122,7 +113,6 @@ jobs:
           echo "version=0.1" >> $GITHUB_OUTPUT
         fi
         
-        # 获取当前标签或commit hash
         if [ -n "${{ github.ref_type }}" ] && [ "${{ github.ref_type }}" = "tag" ]; then
           echo "is-tag=true" >> $GITHUB_OUTPUT
           echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
@@ -131,6 +121,10 @@ jobs:
           SHORT_SHA=$(git rev-parse --short HEAD)
           echo "commit-sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
         fi
+
+    - name: Get current date
+      id: date
+      run: echo "date=$(date +'%Y-%m-%d %H:%M:%S')" >> $GITHUB_OUTPUT
 
     - name: Upload APK to GitHub Release
       if: steps.build.outputs.apk-exists == 'true' && steps.version.outputs.is-tag == 'true'
@@ -144,7 +138,7 @@ jobs:
           - **Version:** ${{ steps.version.outputs.version }}
           - **Tag:** ${{ steps.version.outputs.tag }}
           - **Commit:** ${{ github.sha }}
-          - **Build Date:** ${{ fromJSON(steps.version.outputs.is-tag) && fromJSON(steps.build.outputs.apk-exists) && fromJSON(steps.build.outputs.success) && format('{0}', fromJSON('"' + (fromJSON('"\'now\'"') && fromJSON('"\'Y-m-d H:i:s\'"')) + '"')) }}
+          - **Build Date:** ${{ steps.date.outputs.date }}
           
           ## Installation
           1. Download the APK file
@@ -177,7 +171,7 @@ jobs:
           This is a test build triggered manually via GitHub Actions.
           
           - **Commit:** ${{ steps.version.outputs.commit-sha }}
-          - **Build Date:** ${{ fromJSON(steps.version.outputs.is-tag) && fromJSON(steps.build.outputs.apk-exists) && fromJSON(steps.build.outputs.success) && format('{0}', fromJSON('"' + (fromJSON('"\'now\'"') && fromJSON('"\'Y-m-d H:i:s\'"')) + '"')) }}
+          - **Build Date:** ${{ steps.date.outputs.date }}
           
           This release will be automatically cleaned up after 7 days.
         draft: false
@@ -187,12 +181,8 @@ jobs:
       if: steps.build.outputs.success != 'true'
       run: |
         echo "=== Build Debug Information ==="
+        find ~/.buildozer -type f -name "*.log" | head -10 2>/dev/null || echo "No buildozer logs found"
         
-        # 检查buildozer目录
-        echo "=== Buildozer directory structure ==="
-        find ~/.buildozer -type f -name "*.log" | head -10
-        
-        # 分析构建日志
         if [ -f build.log ]; then
           echo "=== Last 100 lines of build log ==="
           tail -100 build.log
